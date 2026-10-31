@@ -1,0 +1,115 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - mstar
+    tags:
+      - "*"
+  pull_request:
+    branches:
+      - mstar
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libargtable2-dev \
+            libgpiod-dev \
+            libusb-1.0-0-dev \
+            meson \
+            ninja-build
+
+      - name: Configure
+        run: meson setup build --buildtype=release -Dmstar_ddc=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_name="snander_electricboogaloo-linux-x86_64"
+          package_dir="dist/${package_name}"
+          mkdir -p "${package_dir}/bin" "${package_dir}/lib"
+
+          cp build/src/snander_electricboogaloo "${package_dir}/bin/"
+          cp build/subprojects/libusrio/src/libusrio.so "${package_dir}/lib/"
+          cp README.md LICENSE "${package_dir}/"
+
+          while read -r library; do
+            cp -L "${library}" "${package_dir}/lib/"
+          done < <(
+            ldd build/src/snander_electricboogaloo \
+              | awk '$1 ~ /^lib(argtable2|gpiod)\.so/ { print $3 }'
+            ldd build/subprojects/libusrio/src/libusrio.so \
+              | awk '$1 ~ /^lib(argtable2|gpiod)\.so/ { print $3 }'
+          )
+
+          cat > "${package_dir}/RELEASE-README.txt" <<'EOF'
+          Linux x86_64 release build with MStar DDC support enabled.
+
+          Run:
+            ./snander_electricboogaloo --help
+          EOF
+
+          cat > "${package_dir}/snander_electricboogaloo" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="${script_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          exec "${script_dir}/bin/snander_electricboogaloo" "$@"
+          EOF
+          chmod +x "${package_dir}/snander_electricboogaloo"
+
+          tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
+          sha256sum "dist/${package_name}.tar.gz" > "dist/${package_name}.tar.gz.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snander_electricboogaloo-linux-x86_64
+          path: |
+            dist/snander_electricboogaloo-linux-x86_64.tar.gz
+            dist/snander_electricboogaloo-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-linux-x86_64
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: snander_electricboogaloo-linux-x86_64
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/snander_electricboogaloo-linux-x86_64.tar.gz \
+            dist/snander_electricboogaloo-linux-x86_64.tar.gz.sha256 \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"
